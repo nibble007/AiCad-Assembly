@@ -1,192 +1,179 @@
 """
 DSL Parser - Rule-based assembly command parser
-Converts natural syntax or DSL commands into structured operations
+
+Syntax (one command per line or separated by ';'):
+    INSERT  A <depth>[mm|cm|in] B
+    ROTATE  A <deg> <X|Y|Z>
+    ALIGN   A B
+    DUPLICATE A <count>
+    STACK   A B [VERTICAL|HORIZONTAL]
+    FASTEN  A B [type]
+    OFFSET  A <x> <y> <z>        (each value takes optional mm|cm|in)
+
+Flags (anywhere in the text): //ONLY-AI  //ONLY-RULEB  //RULEAI (default)
 """
 
 import re
-import json
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
+
+UNIT_MM = {"mm": 1.0, "cm": 10.0, "in": 25.4}
+
+NAME = r"[\w.\-]+"
+NUM = r"-?\d+(?:\.\d+)?"
+DIST = rf"({NUM})\s*(mm|cm|in)?"
+
+FLAG_RE = re.compile(r"//\s*(ONLY-AI|ONLY-RULEB|RULEAI)\b", re.IGNORECASE)
 
 
 @dataclass
 class Command:
-    """Represents a single assembly command"""
-    type: str  # INSERT, ROTATE, ALIGN, etc
+    """A single assembly command. All distances are stored in mm."""
+    type: str
     obj_a: str = ""
     obj_b: str = ""
     depth: Optional[float] = None
-    unit: str = "mm"
+    unit: str = ""
     degrees: Optional[float] = None
     axis: str = ""
     direction: str = ""
     count: Optional[int] = None
-    x: float = 0
-    y: float = 0
-    z: float = 0
+    x: Optional[float] = None
+    y: Optional[float] = None
+    z: Optional[float] = None
     strategy: str = ""
 
-    def to_dict(self):
+    def to_dict(self) -> Dict:
         return {k: v for k, v in asdict(self).items() if v is not None and v != ""}
 
 
+def _mm(value: str, unit: Optional[str]) -> float:
+    return float(value) * UNIT_MM[(unit or "mm").lower()]
+
+
 class DSLParser:
-    """Parse assembly DSL into structured commands"""
+    """Parse assembly DSL into structured commands."""
 
     COMMAND_PATTERN = {
-        "INSERT": r"INSERT\s+([\w-]+)\s+([\d.]+)(?:mm|cm|in)?\s+([\w-]+)",
-        "ROTATE": r"ROTATE\s+([\w-]+)\s+([\d.]+)\s+([XYZ])",
-        "ALIGN": r"ALIGN\s+([\w-]+)\s+([\w-]+)",
-        "DUPLICATE": r"DUPLICATE\s+([\w-]+)\s+(\d+)",
-        "STACK": r"STACK\s+([\w-]+)\s+([\w-]+)\s+(VERTICAL|HORIZONTAL)",
-        "FASTEN": r"FASTEN\s+([\w-]+)\s+([\w-]+)\s+([\w-]+)",
-        "OFFSET": r"OFFSET\s+([\w-]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
+        "INSERT": re.compile(rf"INSERT\s+({NAME})\s+{DIST}\s+({NAME})", re.I),
+        "ROTATE": re.compile(rf"ROTATE\s+({NAME})\s+({NUM})\s*(?:deg(?:rees)?)?\s+([XYZ])", re.I),
+        "ALIGN": re.compile(rf"ALIGN\s+({NAME})\s+({NAME})", re.I),
+        "DUPLICATE": re.compile(rf"DUPLICATE\s+({NAME})\s+(\d+)", re.I),
+        "STACK": re.compile(rf"STACK\s+({NAME})\s+({NAME})(?:\s+(VERTICAL|HORIZONTAL))?", re.I),
+        "FASTEN": re.compile(rf"FASTEN\s+({NAME})\s+({NAME})(?:\s+({NAME}))?", re.I),
+        "OFFSET": re.compile(rf"OFFSET\s+({NAME})\s+{DIST}\s+{DIST}\s+{DIST}", re.I),
     }
 
     def __init__(self):
-        self.commands = []
+        self.commands: List[Command] = []
+        self.unknown_parts: List[str] = []
         self.parse_quality = "unknown"
         self.confidence = 0.0
 
+    # ------------------------------------------------------------------
+    # Flags
+    # ------------------------------------------------------------------
     def extract_flag(self, text: str) -> Tuple[str, str]:
-        """
-        Extract execution flag and clean text.
-        Returns: (flag, clean_text)
-        """
-        flags = ["ONLY-AI", "ONLY-RULEB", "RULEAI"]
-        
-        for flag in flags:
-            if f"//{flag}" in text.upper():
-                clean = re.sub(rf"//\s*{flag}\s*\n?", "", text, flags=re.IGNORECASE)
-                return flag, clean.strip()
-        
-        return "RULEAI", text.strip()  # Default
+        """Return (flag, text_without_flag). Default flag is RULEAI."""
+        m = FLAG_RE.search(text)
+        if not m:
+            return "RULEAI", text.strip()
+        return m.group(1).upper(), FLAG_RE.sub("", text).strip()
 
-    def parse_distance(self, dist_str: str) -> Tuple[float, str]:
-        """
-        Parse distance string like '20mm', '5cm', '2in'
-        Returns: (value, unit)
-        """
-        match = re.match(r"([\d.]+)(mm|cm|in)?", dist_str.strip())
-        if match:
-            value = float(match.group(1))
-            unit = match.group(2) or "mm"
-            return value, unit
-        return 0, "mm"
+    # ------------------------------------------------------------------
+    # Part-name handling (supports names with spaces, e.g. "Square Hole")
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _protect(line: str, known: List[str]) -> str:
+        """Replace known part names (longest first) with space-free tokens."""
+        order = sorted(range(len(known)), key=lambda i: -len(known[i]))
+        for i in order:
+            pat = rf"(?<![\w.\-]){re.escape(known[i])}(?![\w.\-])"
+            line = re.sub(pat, f"__P{i}__", line, flags=re.IGNORECASE)
+        return line
 
-    def parse_single_command(self, line: str) -> Optional[Command]:
-        """
-        Try to parse a single DSL line.
-        Returns Command or None if no match.
-        """
-        line = line.strip().upper()
-        if not line or line.startswith("#"):
+    def _restore(self, token: str, known: Optional[List[str]]) -> str:
+        if not token:
+            return token
+        m = re.fullmatch(r"__P(\d+)__", token)
+        if m and known:
+            return known[int(m.group(1))]
+        if known and token.lower() not in (k.lower() for k in known):
+            if token not in self.unknown_parts:
+                self.unknown_parts.append(token)
+        return token
+
+    # ------------------------------------------------------------------
+    # Single command
+    # ------------------------------------------------------------------
+    def parse_single_command(self, line: str, known: Optional[List[str]] = None) -> Optional[Command]:
+        line = line.strip()
+        if not line or line.startswith(("#", "//")):
             return None
 
-        # Try each pattern
-        for cmd_type, pattern in self.COMMAND_PATTERN.items():
-            match = re.match(pattern, line)
-            if match:
-                return self._create_command(cmd_type, match)
+        if known:
+            line = self._protect(line, known)
 
-        return None
+        keyword = line.split(None, 1)[0].upper()
+        pattern = self.COMMAND_PATTERN.get(keyword)
+        if not pattern:
+            return None
 
-    def _create_command(self, cmd_type: str, match) -> Command:
-        """Create Command object from regex match"""
-        groups = match.groups()
+        m = pattern.fullmatch(line)
+        if not m:
+            return None
+
+        return self._create_command(keyword, m.groups(), known)
+
+    def _create_command(self, cmd_type: str, g: tuple, known) -> Command:
+        r = lambda t: self._restore(t, known)
 
         if cmd_type == "INSERT":
-            depth, unit = self.parse_distance(groups[1])
+            return Command("INSERT", obj_a=r(g[0]), depth=_mm(g[1], g[2]), unit="mm", obj_b=r(g[3]))
+        if cmd_type == "ROTATE":
+            return Command("ROTATE", obj_a=r(g[0]), degrees=float(g[1]), axis=g[2].upper())
+        if cmd_type == "ALIGN":
+            return Command("ALIGN", obj_a=r(g[0]), obj_b=r(g[1]))
+        if cmd_type == "DUPLICATE":
+            return Command("DUPLICATE", obj_a=r(g[0]), count=int(g[1]))
+        if cmd_type == "STACK":
+            return Command("STACK", obj_a=r(g[0]), obj_b=r(g[1]), direction=(g[2] or "VERTICAL").upper())
+        if cmd_type == "FASTEN":
+            return Command("FASTEN", obj_a=r(g[0]), obj_b=r(g[1]), strategy=(g[2] or "SCREW").upper())
+        if cmd_type == "OFFSET":
             return Command(
-                type="INSERT",
-                obj_a=groups[0],
-                depth=depth,
-                unit=unit,
-                obj_b=groups[2]
+                "OFFSET", obj_a=r(g[0]), unit="mm",
+                x=_mm(g[1], g[2]), y=_mm(g[3], g[4]), z=_mm(g[5], g[6]),
             )
+        raise ValueError(cmd_type)
 
-        elif cmd_type == "ROTATE":
-            return Command(
-                type="ROTATE",
-                obj_a=groups[0],
-                degrees=float(groups[1]),
-                axis=groups[2]
-            )
-
-        elif cmd_type == "ALIGN":
-            return Command(
-                type="ALIGN",
-                obj_a=groups[0],
-                obj_b=groups[1]
-            )
-
-        elif cmd_type == "DUPLICATE":
-            return Command(
-                type="DUPLICATE",
-                obj_a=groups[0],
-                count=int(groups[1])
-            )
-
-        elif cmd_type == "STACK":
-            return Command(
-                type="STACK",
-                obj_a=groups[0],
-                obj_b=groups[1],
-                direction=groups[2]
-            )
-
-        elif cmd_type == "FASTEN":
-            return Command(
-                type="FASTEN",
-                obj_a=groups[0],
-                obj_b=groups[1],
-                strategy=groups[2]
-            )
-
-        elif cmd_type == "OFFSET":
-            return Command(
-                type="OFFSET",
-                obj_a=groups[0],
-                x=float(groups[1]),
-                y=float(groups[2]),
-                z=float(groups[3])
-            )
-
-        return None
-
-    def parse(self, text: str) -> Dict:
+    # ------------------------------------------------------------------
+    # Full parse
+    # ------------------------------------------------------------------
+    def parse(self, text: str, known_parts: Optional[List[str]] = None) -> Dict:
         """
-        Main parse function.
-        
         Args:
-            text: Input text (DSL or natural language)
-        
-        Returns:
-            dict with commands, parse_quality, confidence, flag
+            text: DSL text (optionally with a //FLAG)
+            known_parts: names of loaded parts (file stems). Enables names with
+                         spaces and case-insensitive matching to the real part name.
         """
-        # Extract flag
-        flag, clean_text = self.extract_flag(text)
+        flag, clean = self.extract_flag(text)
 
         self.commands = []
+        self.unknown_parts = []
         self.parse_quality = "rule"
-        self.confidence = 0.0
 
-        # Split by ; or newline
-        lines = re.split(r"[;\n]", clean_text)
+        lines = [l.strip() for l in re.split(r"[;\n]", clean)]
+        lines = [l for l in lines if l and not l.startswith(("#", "//"))]
 
-        matched = 0
         for line in lines:
-            cmd = self.parse_single_command(line)
+            cmd = self.parse_single_command(line, known_parts)
             if cmd:
                 self.commands.append(cmd)
-                matched += 1
 
-        # Calculate confidence
-        total_lines = len([l for l in lines if l.strip() and not l.startswith("#")])
-        if total_lines > 0:
-            self.confidence = matched / total_lines
-        else:
-            self.confidence = 1.0
+        matched = len(self.commands)
+        total = len(lines)
+        self.confidence = matched / total if total else 1.0
 
         return {
             "flag": flag,
@@ -194,10 +181,17 @@ class DSLParser:
             "parse_quality": self.parse_quality,
             "confidence": self.confidence,
             "matched_lines": matched,
-            "total_lines": total_lines
+            "total_lines": total,
+            "unknown_parts": list(self.unknown_parts),
         }
 
 
-
 if __name__ == "__main__":
-    parser = DSLParser()
+    import json
+    p = DSLParser()
+    sample = """//ONLY-RULEB
+    insert extruded square 5cm Square Hole
+    ROTATE Extruded Square -90 x
+    ALIGN Square Hole Extruded Square
+    garbage line"""
+    print(json.dumps(p.parse(sample, ["Square Hole", "Extruded Square"]), indent=2))
